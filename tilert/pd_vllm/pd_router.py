@@ -4,7 +4,8 @@ Does OpenAI-semantics output parsing (reasoning + tool calls), streaming and
 non-streaming.
 
 Flow per request (phase-1 hybrid, see design doc):
-  1. pick a free decode node (in-memory busy tracking; all busy -> 429)
+  1. pick a free decode node (in-memory busy tracking; all busy -> wait up to
+     --queue-timeout, then 429)
   2. forward to vLLM with max_tokens=1 + logprobs and inject
      kv_transfer_params {tilert_host, tilert_ctrl_port} — the connector
      claims the request and RDMA-sends state to the decode node
@@ -40,6 +41,9 @@ from tilert.pd_vllm.wire import derive_rid
 
 logger = logging.getLogger("pd_vllm.router")
 
+# Only log a queue wait once it is long enough to explain a latency bump.
+QUEUE_LOG_SECONDS = 0.1
+
 
 class DecodeNode:
     def __init__(self, host: str, ctrl_port: int, http_port: int):
@@ -54,21 +58,43 @@ class DecodeNode:
 
 
 class Pool:
-    def __init__(self, nodes: list[DecodeNode]):
+    """Decode-node reservation.
+
+    ``queue_timeout`` > 0 makes ``acquire`` wait for a node instead of failing
+    fast. A decode engine serves one sequence at a time, so a client that puts
+    more than one request in flight per node — a multi-turn agentic session
+    fanning out into concurrent sub-conversations, for instance — otherwise gets
+    429s for load the pool can serve a moment later. 0 keeps the fail-fast
+    behaviour.
+    """
+
+    def __init__(self, nodes: list[DecodeNode], queue_timeout: float = 0.0):
         self.nodes = nodes
-        self._lock = threading.Lock()
+        self.queue_timeout = queue_timeout
+        self._cv = threading.Condition()
 
     def acquire(self) -> DecodeNode | None:
-        with self._lock:
-            for n in self.nodes:
-                if not n.busy:
-                    n.busy = True
-                    return n
-        return None
+        """Reserve a node, or None once ``queue_timeout`` elapses.
+
+        Blocks while waiting; both call sites already hop off the event loop via
+        ``run_in_threadpool``, so other streams keep being served.
+        """
+        deadline = time.monotonic() + self.queue_timeout
+        with self._cv:
+            while True:
+                for n in self.nodes:
+                    if not n.busy:
+                        n.busy = True
+                        return n
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cv.wait(remaining)
 
     def release(self, node: DecodeNode) -> None:
-        with self._lock:
+        with self._cv:
             node.busy = False
+            self._cv.notify()
 
 
 def first_token_from_logprobs(resp: dict, is_chat: bool) -> int:
@@ -154,6 +180,29 @@ def build_app(ctx: RouterCtx) -> FastAPI:
     app = FastAPI()
     pool = ctx.pool
 
+    def _acquire_node() -> tuple[DecodeNode | None, float]:
+        """Reserve a node, and report how long the caller had to queue for it.
+
+        A decode engine serves one sequence at a time, so a client that fans out
+        — an agentic session spawning sub-conversations, say — serialises here.
+        That wait is invisible in the response, hence the log line.
+        """
+        t0 = time.monotonic()
+        node = pool.acquire()
+        waited = time.monotonic() - t0
+        if node is not None and waited >= QUEUE_LOG_SECONDS:
+            logger.info("queued %.1fs for decode node %s", waited, node.host)
+        return node, waited
+
+    def _busy_response(waited: float) -> JSONResponse:
+        """429 body: a pool that is full reads differently from one we waited on."""
+        detail = (
+            f"no decode node free after waiting {waited:.1f}s"
+            if pool.queue_timeout > 0
+            else "all decode nodes busy"
+        )
+        return JSONResponse({"error": detail}, status_code=429)
+
     @app.get("/health")
     def health():
         return {"status": "ok", "decode_free": sum(1 for n in pool.nodes if not n.busy)}
@@ -178,9 +227,9 @@ def build_app(ctx: RouterCtx) -> FastAPI:
     # ── non-streaming ────────────────────────────────────────────────────
     def _handle(path: str, body: dict):
         is_chat = path.endswith("chat/completions")
-        node = pool.acquire()
+        node, waited = _acquire_node()
         if node is None:
-            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
+            return _busy_response(waited)
         t0 = time.time()
         try:
             prefill = _prefill(path, body, node)
@@ -255,20 +304,37 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
     # ── streaming (chat only) ────────────────────────────────────────────
     async def _handle_stream(path: str, body: dict, request: Request):
+        import anyio
         from starlette.concurrency import run_in_threadpool
 
-        node = pool.acquire()
-        if node is None:
-            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
-
+        # The reservation must be inside the try: a client disconnect cancels this
+        # task, and until streaming starts the generator's finally — the usual
+        # release path — does not exist yet. Both handlers below release.
+        node = None
         try:
+            # Shielded so a disconnect cannot interrupt the queue wait itself and
+            # strand a reservation the worker thread already made. Bounded by
+            # --queue-timeout, which is what we were waiting for anyway.
+            with anyio.CancelScope(shield=True):
+                node, waited = await run_in_threadpool(_acquire_node)
+            if node is None:
+                return _busy_response(waited)
             prefill = await run_in_threadpool(_prefill, path, body, node)
             rid = derive_rid(prefill["id"])
             first_token_id = first_token_from_logprobs(prefill, True)
         except Exception as e:
-            pool.release(node)
+            if node is not None:
+                pool.release(node)
             logger.exception("pd stream request failed before streaming")
             return JSONResponse({"error": str(e)}, status_code=502)
+        except BaseException:
+            # CancelledError is not an Exception. anyio delivers a pending
+            # cancellation when the shielded scope exits — after the reservation
+            # is made, before streaming starts — so this clause is what keeps the
+            # node from staying busy forever. See drafts/mock_router_cancel.py.
+            if node is not None:
+                pool.release(node)
+            raise
 
         chunk_id = prefill["id"]
         model = prefill.get("model")
@@ -468,6 +534,12 @@ def main() -> None:
         default="glm47",
         help="output parser (reasoning + tool calls)",
     )
+    ap.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=0.0,
+        help="seconds to wait for a free decode node before answering 429 (0: fail fast)",
+    )
     args = ap.parse_args()
 
     nodes = []
@@ -483,7 +555,7 @@ def main() -> None:
             args.model_path, trust_remote_code=True
         )  # nosec B615
 
-    ctx = RouterCtx(args.vllm_url, Pool(nodes), tokenizer, args.parser)
+    ctx = RouterCtx(args.vllm_url, Pool(nodes, args.queue_timeout), tokenizer, args.parser)
     app = build_app(ctx)
     logger.info(
         "router on :%d -> vllm=%s, %d decode node(s), parser=%s",

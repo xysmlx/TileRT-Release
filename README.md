@@ -363,6 +363,8 @@ python -m tilert.pd_vllm.pd_router \
 
 Send OpenAI requests to `http://<router>:23333/v1/chat/completions`. The router runs the prefill on vLLM (first token), hands the attention state to the TileRT decode node over RDMA, and streams the completion back.
 
+A decode engine serves one sequence at a time, so the router reserves a node per request and answers `429` while they are all busy. Add `--queue-timeout <seconds>` to make a request wait for a free node instead of failing: useful when a single client fans out into concurrent sub-conversations — an agentic session spawning sub-agents, say — and the burst is wider than the pool but short-lived. Waits longer than 0.1 s are logged. The default, `0`, keeps the fail-fast behaviour.
+
 ### Topology B: shared prefill → TileRT decode **and** native vLLM decode
 
 One prefill pool feeds two decode pools side by side, composed under vLLM's `MultiConnector`. Each request is claimed by exactly one connector — the TileRT connector claims requests marked with `tilert_host`, and vLLM's native connector handles the rest — so latency-critical traffic goes to TileRT while general traffic stays on native vLLM decode, behind the same OpenAI surface.
