@@ -4,7 +4,8 @@ Does OpenAI-semantics output parsing (reasoning + tool calls), streaming and
 non-streaming.
 
 Flow per request (phase-1 hybrid, see design doc):
-  1. pick a free decode node (in-memory busy tracking; all busy -> 429)
+  1. pick a free decode node (in-memory busy tracking; all busy -> wait up to
+     --queue-timeout, then 429)
   2. forward to vLLM with max_tokens=1 + logprobs and inject
      kv_transfer_params {tilert_host, tilert_ctrl_port} — the connector
      claims the request and RDMA-sends state to the decode node
@@ -40,6 +41,8 @@ from tilert.pd_vllm.wire import derive_rid
 
 logger = logging.getLogger("pd_vllm.router")
 
+QUEUE_LOG_SECONDS = 0.1
+
 
 class DecodeNode:
     def __init__(self, host: str, ctrl_port: int, http_port: int):
@@ -54,21 +57,31 @@ class DecodeNode:
 
 
 class Pool:
-    def __init__(self, nodes: list[DecodeNode]):
+    """Decode-node reservation; ``queue_timeout`` > 0 waits instead of failing fast."""
+
+    def __init__(self, nodes: list[DecodeNode], queue_timeout: float = 0.0):
         self.nodes = nodes
-        self._lock = threading.Lock()
+        self.queue_timeout = queue_timeout
+        self._cv = threading.Condition()
 
     def acquire(self) -> DecodeNode | None:
-        with self._lock:
-            for n in self.nodes:
-                if not n.busy:
-                    n.busy = True
-                    return n
-        return None
+        """Reserve a node, or None once ``queue_timeout`` elapses."""
+        deadline = time.monotonic() + self.queue_timeout
+        with self._cv:
+            while True:
+                for n in self.nodes:
+                    if not n.busy:
+                        n.busy = True
+                        return n
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cv.wait(remaining)
 
     def release(self, node: DecodeNode) -> None:
-        with self._lock:
+        with self._cv:
             node.busy = False
+            self._cv.notify()
 
 
 def first_token_from_logprobs(resp: dict, is_chat: bool) -> int:
@@ -154,6 +167,24 @@ def build_app(ctx: RouterCtx) -> FastAPI:
     app = FastAPI()
     pool = ctx.pool
 
+    def _acquire_node() -> tuple[DecodeNode | None, float]:
+        """Reserve a node, and report how long the caller queued for it."""
+        t0 = time.monotonic()
+        node = pool.acquire()
+        waited = time.monotonic() - t0
+        if node is not None and waited >= QUEUE_LOG_SECONDS:
+            logger.info("queued %.1fs for decode node %s", waited, node.host)
+        return node, waited
+
+    def _busy_response(waited: float) -> JSONResponse:
+        """429 body, distinguishing a full pool from an exhausted queue timeout."""
+        detail = (
+            f"no decode node free after waiting {waited:.1f}s"
+            if pool.queue_timeout > 0
+            else "all decode nodes busy"
+        )
+        return JSONResponse({"error": detail}, status_code=429)
+
     @app.get("/health")
     def health():
         return {"status": "ok", "decode_free": sum(1 for n in pool.nodes if not n.busy)}
@@ -178,9 +209,9 @@ def build_app(ctx: RouterCtx) -> FastAPI:
     # ── non-streaming ────────────────────────────────────────────────────
     def _handle(path: str, body: dict):
         is_chat = path.endswith("chat/completions")
-        node = pool.acquire()
+        node, waited = _acquire_node()
         if node is None:
-            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
+            return _busy_response(waited)
         t0 = time.time()
         try:
             prefill = _prefill(path, body, node)
@@ -255,20 +286,29 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
     # ── streaming (chat only) ────────────────────────────────────────────
     async def _handle_stream(path: str, body: dict, request: Request):
+        import anyio
         from starlette.concurrency import run_in_threadpool
 
-        node = pool.acquire()
-        if node is None:
-            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
-
+        node = None  # reserved inside the try: both handlers below release it
         try:
+            # Shielded: a disconnect must not strand a reservation mid-acquire.
+            with anyio.CancelScope(shield=True):
+                node, waited = await run_in_threadpool(_acquire_node)
+            if node is None:
+                return _busy_response(waited)
             prefill = await run_in_threadpool(_prefill, path, body, node)
             rid = derive_rid(prefill["id"])
             first_token_id = first_token_from_logprobs(prefill, True)
         except Exception as e:
-            pool.release(node)
+            if node is not None:
+                pool.release(node)
             logger.exception("pd stream request failed before streaming")
             return JSONResponse({"error": str(e)}, status_code=502)
+        except BaseException:
+            # CancelledError is not an Exception; without this the node stays busy.
+            if node is not None:
+                pool.release(node)
+            raise
 
         chunk_id = prefill["id"]
         model = prefill.get("model")
@@ -384,6 +424,8 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                             if finish_reason == "cancelled":
                                 finish_reason = "stop"
                         elif "error" in msg:
+                            if not role_sent:
+                                yield _role_once()
                             yield _chunk({"content": f"\n[decode error: {msg['error']}]"})
                             finish_reason = "stop"
                 if client_gone:
@@ -466,6 +508,12 @@ def main() -> None:
         default="glm47",
         help="output parser (reasoning + tool calls)",
     )
+    ap.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=0.0,
+        help="seconds to wait for a free decode node before answering 429 (0: fail fast)",
+    )
     args = ap.parse_args()
 
     nodes = []
@@ -481,7 +529,7 @@ def main() -> None:
             args.model_path, trust_remote_code=True
         )  # nosec B615
 
-    ctx = RouterCtx(args.vllm_url, Pool(nodes), tokenizer, args.parser)
+    ctx = RouterCtx(args.vllm_url, Pool(nodes, args.queue_timeout), tokenizer, args.parser)
     app = build_app(ctx)
     logger.info(
         "router on :%d -> vllm=%s, %d decode node(s), parser=%s",
